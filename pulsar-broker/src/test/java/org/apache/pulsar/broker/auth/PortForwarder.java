@@ -1,198 +1,119 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
-package org.apache.pulsar.broker.auth;
+package io.netty.example.proxy;
 
 import io.netty.bootstrap.Bootstrap;
-import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.Unpooled;
-import io.netty.channel.Channel;
-import io.netty.channel.ChannelFuture;
-import io.netty.channel.ChannelFutureListener;
-import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.ChannelInboundHandlerAdapter;
-import io.netty.channel.ChannelInitializer;
-import io.netty.channel.ChannelOption;
-import io.netty.channel.EventLoopGroup;
-import io.netty.channel.nio.NioEventLoopGroup;
-import io.netty.channel.socket.SocketChannel;
-import io.netty.channel.socket.nio.NioServerSocketChannel;
-import io.netty.handler.logging.LogLevel;
-import io.netty.handler.logging.LoggingHandler;
-import java.net.SocketAddress;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import io.netty.channel.*;
+import io.netty.channel.group.ChannelGroup;
+import io.netty.channel.group.DefaultChannelGroup;
+import io.netty.util.concurrent.GlobalEventExecutor;
 
 /**
- * A TCP server that performs port forwarding for test purposes.
+ * A Netty proxy frontend handler that forwards incoming traffic
+ * to two backend servers (Server 2 and Server 3).
+ * Server 2 can send and receive traffic,
+ * while Server 3 only receives traffic — any replies are discarded.
  */
-public class PortForwarder implements AutoCloseable {
+public class HexDumpProxyFrontendHandler extends ChannelInboundHandlerAdapter {
 
-    private static final Logger LOG = LoggerFactory.getLogger(PortForwarder.class);
+    private final String remoteHost;
+    private final int server2Port;
+    private final int server3Port;
 
-    private final SocketAddress targetAddress;
-    private final Channel serverChannel;
-    private final EventLoopGroup bossGroup;
-    private final EventLoopGroup workerGroup;
+    private Channel server2OutboundChannel;
+    private Channel server3OutboundChannel;
 
-    /**
-     * Creates a port forwarding service.
-     *
-     * @param listenAddress the local address to listen on.
-     * @param targetAddress the remote address to forward traffic to.
-     */
-    public PortForwarder(SocketAddress listenAddress, SocketAddress targetAddress) {
-        this.targetAddress = targetAddress;
-        this.bossGroup = new NioEventLoopGroup(1);
-        this.workerGroup = new NioEventLoopGroup();
-        try {
-            ServerBootstrap b = new ServerBootstrap();
-            this.serverChannel = b.group(bossGroup, workerGroup)
-                    .channel(NioServerSocketChannel.class)
-                    .handler(new LoggingHandler(PortForwarder.class, LogLevel.DEBUG))
-                    .childHandler(new Initializer())
-                    .childOption(ChannelOption.AUTO_READ, false)
-                    .option(ChannelOption.SO_REUSEADDR, true)
-                    .bind(listenAddress).sync().channel();
+    private final ChannelGroup channels = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
 
-            LOG.info("Started port forwarding service on {}, target: {}", listenAddress, targetAddress);
-        } catch(Exception e) {
-            throw new RuntimeException(String.format("failed to bind to %s: %s", listenAddress, e.getMessage()), e);
+    public HexDumpProxyFrontendHandler(String remoteHost, int server2Port, int server3Port) {
+        this.remoteHost = remoteHost;
+        this.server2Port = server2Port;
+        this.server3Port = server3Port;
+    }
+
+    @Override
+    public void channelActive(ChannelHandlerContext ctx) {
+        final Channel inboundChannel = ctx.channel();
+
+        // Connect to Server 3 (only to send data, replies discarded)
+        Bootstrap server3Bootstrap = new Bootstrap();
+        server3Bootstrap.group(inboundChannel.eventLoop())
+                .channel(ctx.channel().getClass())
+                .handler(new DiscardServerHandler())
+                .option(ChannelOption.AUTO_READ, false);
+
+        ChannelFuture server3Future = server3Bootstrap.connect(remoteHost, server3Port);
+        server3OutboundChannel = server3Future.channel();
+
+        // Connect to Server 2 (full duplex)
+        Bootstrap server2Bootstrap = new Bootstrap();
+        server2Bootstrap.group(inboundChannel.eventLoop())
+                .channel(ctx.channel().getClass())
+                .handler(new HexDumpProxyBackendHandler(inboundChannel))
+                .option(ChannelOption.AUTO_READ, false);
+
+        ChannelFuture server2Future = server2Bootstrap.connect(remoteHost, server2Port);
+        server2OutboundChannel = server2Future.channel();
+
+        server2Future.addListener((ChannelFutureListener) future -> {
+            if (future.isSuccess()) {
+                inboundChannel.read();
+            } else {
+                inboundChannel.close();
+            }
+        });
+
+        // Add channels to the group
+        channels.add(server2OutboundChannel);
+        channels.add(server3OutboundChannel);
+    }
+
+    @Override
+    public void channelRead(final ChannelHandlerContext ctx, Object msg) {
+        msg.retain(); // increment ref count because we send to two channels
+
+        if (server2OutboundChannel.isActive()) {
+            server2OutboundChannel.writeAndFlush(msg).addListener((ChannelFutureListener) future -> {
+                if (future.isSuccess()) {
+                    ctx.channel().read();
+                } else {
+                    future.channel().close();
+                }
+            });
+        }
+
+        if (server3OutboundChannel.isActive()) {
+            server3OutboundChannel.writeAndFlush(msg).addListener((ChannelFutureListener) future -> {
+                if (future.isSuccess()) {
+                    ctx.channel().read();
+                } else {
+                    future.channel().close();
+                }
+            });
         }
     }
 
     @Override
-    public void close() throws Exception {
-        serverChannel.close().sync();
-        bossGroup.shutdownGracefully();
-        workerGroup.shutdownGracefully();
+    public void channelInactive(ChannelHandlerContext ctx) {
+        if (server2OutboundChannel != null) {
+            closeOnFlush(server2OutboundChannel);
+        }
+        if (server3OutboundChannel != null) {
+            closeOnFlush(server3OutboundChannel);
+        }
     }
 
-    private static void closeOnFlush(Channel ch) {
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+        cause.printStackTrace();
+        closeOnFlush(ctx.channel());
+    }
+
+    /**
+     * Closes the specified channel after all queued write requests are flushed.
+     */
+    static void closeOnFlush(Channel ch) {
         if (ch.isActive()) {
             ch.writeAndFlush(Unpooled.EMPTY_BUFFER).addListener(ChannelFutureListener.CLOSE);
-        }
-    }
-
-    private class Initializer extends ChannelInitializer<SocketChannel> {
-        @Override
-        public void initChannel(SocketChannel ch) {
-            ch.pipeline().addLast(new LoggingHandler(PortForwarder.class, LogLevel.DEBUG), new FrontendHandler());
-        }
-    }
-
-    private class FrontendHandler extends ChannelInboundHandlerAdapter {
-
-        private volatile Channel outboundChannel;
-
-        @Override
-        public void channelActive(ChannelHandlerContext ctx) {
-            final Channel inboundChannel = ctx.channel();
-
-            // Start the connection attempt.
-            Bootstrap b = new Bootstrap();
-            b.group(inboundChannel.eventLoop())
-                    .channel(ctx.channel().getClass())
-                    .handler(new BackendHandler(inboundChannel))
-                    .option(ChannelOption.AUTO_READ, false);
-            ChannelFuture f = b.connect(targetAddress);
-            outboundChannel = f.channel();
-            f.addListener(new ChannelFutureListener() {
-                @Override
-                public void operationComplete(ChannelFuture future) {
-                    if (future.isSuccess()) {
-                        // connection complete start to read first data
-                        inboundChannel.read();
-                    } else {
-                        // Close the connection if the connection attempt has failed.
-                        inboundChannel.close();
-                    }
-                }
-            });
-        }
-
-        @Override
-        public void channelRead(final ChannelHandlerContext ctx, Object msg) {
-            if (outboundChannel.isActive()) {
-                outboundChannel.writeAndFlush(msg).addListener(new ChannelFutureListener() {
-                    @Override
-                    public void operationComplete(ChannelFuture future) {
-                        if (future.isSuccess()) {
-                            // was able to flush out data, start to read the next chunk
-                            ctx.channel().read();
-                        } else {
-                            future.channel().close();
-                        }
-                    }
-                });
-            }
-        }
-
-        @Override
-        public void channelInactive(ChannelHandlerContext ctx) {
-            if (outboundChannel != null) {
-                closeOnFlush(outboundChannel);
-            }
-        }
-
-        @Override
-        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            LOG.error("frontend exception", cause);
-            closeOnFlush(ctx.channel());
-        }
-    }
-
-    private class BackendHandler extends ChannelInboundHandlerAdapter {
-
-        private final Channel inboundChannel;
-
-        public BackendHandler(Channel inboundChannel) {
-            this.inboundChannel = inboundChannel;
-        }
-
-        @Override
-        public void channelActive(ChannelHandlerContext ctx) {
-            ctx.read();
-        }
-
-        @Override
-        public void channelRead(final ChannelHandlerContext ctx, Object msg) {
-            inboundChannel.writeAndFlush(msg).addListener(new ChannelFutureListener() {
-                @Override
-                public void operationComplete(ChannelFuture future) {
-                    if (future.isSuccess()) {
-                        ctx.channel().read();
-                    } else {
-                        future.channel().close();
-                    }
-                }
-            });
-        }
-
-        @Override
-        public void channelInactive(ChannelHandlerContext ctx) {
-            closeOnFlush(inboundChannel);
-        }
-
-        @Override
-        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            LOG.error("backend exception", cause);
-            closeOnFlush(ctx.channel());
         }
     }
 }
